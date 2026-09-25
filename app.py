@@ -7,9 +7,11 @@ from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 import pandas as pd
 import io
+import re
 
 # --- Helper functions to parse Word structure ---
 def iter_block_items(parent):
+    """Iterates through paragraphs and tables in their actual document order."""
     if isinstance(parent, Document):
         parent_elm = parent.element.body
     elif isinstance(parent, _Cell):
@@ -24,7 +26,7 @@ def iter_block_items(parent):
             yield Table(child, parent)
 
 def extract_colored_lines(block):
-    """Extracts text line-by-line from a block, detecting red text formatting."""
+    """Extracts text line-by-line, detecting soft-returns and red text formatting."""
     lines = []
     current_line_text = ""
     current_line_red = False
@@ -55,129 +57,159 @@ def extract_colored_lines(block):
         
     return lines
 
-# --- Core Parsing Logic ---
-def parse_with_placeholders(file_obj, exam_id):
+def is_new_question_start(text):
+    """Heuristic logic to detect if a line of text is a new question."""
+    text = text.strip()
+    if not text: return False
+    
+    # 1. Explicit numbering (e.g., "1. ", "1)", "Q1.")
+    if re.match(r'^(Q?\d+[\.\)])\s+', text, re.IGNORECASE): 
+        return True
+        
+    # 2. Strong question punctuation
+    if text.endswith('?') or text.endswith('=') or text.endswith('...') or text.endswith(':'): 
+        return True
+    if text.startswith('___'): 
+        return True
+        
+    # 3. Common question starting words
+    if re.match(r'^(which|what|how|why|when|where|name|select)\b', text, re.IGNORECASE) and len(text) > 15: 
+        return True
+        
+    # 4. Specific Machinist/Technical test endings
+    if text.endswith("is") or text.endswith("called") or text.endswith("cost"): 
+        return True
+        
+    # 5. Catch-all: If it's a very long sentence and doesn't look like an option
+    is_option_format = re.match(r'^([a-zA-Z][\.\)]\s+|Answer:)', text, re.IGNORECASE)
+    if not is_option_format and len(text) > 55:
+        return True
+        
+    return False
+
+# --- Core Dynamic Parsing Logic ---
+def parse_unlimited_options(file_obj, exam_id):
     doc = docx.Document(file_obj)
     blocks = list(iter_block_items(doc))
     
-    parsed_data = []
-    i = 0
+    # Flatten the document into a strict line-by-line sequence
+    all_lines = []
     parsing_started = False
     
-    while i < len(blocks):
-        block = blocks[i]
-        
-        # Start parsing when Part 1 begins
-        if isinstance(block, Paragraph) and "Part-1:" in block.text:
-            parsing_started = True
-            i += 1
-            continue
-            
-        if not parsing_started:
-            i += 1
-            continue
-            
+    for block in blocks:
         if isinstance(block, Paragraph):
-            if not block.text.strip():
-                i += 1
+            if "Part-1:" in block.text:
+                parsing_started = True
+                continue
+            if not parsing_started:
                 continue
                 
-            has_image = 'w:drawing' in block._element.xml or 'v:imagedata' in block._element.xml
-            
-            # Extract all lines (this fixes the soft return / \n issue)
+            has_img = 'w:drawing' in block._element.xml or 'v:imagedata' in block._element.xml
             para_lines = extract_colored_lines(block)
-            
-            # SCENARIO 1: Question and Options are bundled in the SAME paragraph block
-            if len(para_lines) >= 5:
-                current_question = para_lines[0]['text']
-                options = [line['text'] for line in para_lines[1:]]
+            for l in para_lines:
+                l['has_image'] = has_img
+                all_lines.append(l)
                 
-                # Find the red option, or default to the first one
-                correct_option = next((line['text'] for line in para_lines[1:] if line['is_red']), options[0])
-                
-                if has_image:
-                    parsed_data.append({
-                        'q_id': f"{exam_id}_{len(parsed_data) + 1}",
-                        'text': f"[IMAGE REQUIRED - UPDATE MANUALLY] {current_question}",
-                        'options': ["Option A", "Option B", "Option C", "Option D"],
-                        'correct': "Option A"
-                    })
-                else:
-                    parsed_data.append({
-                        'q_id': f"{exam_id}_{len(parsed_data) + 1}",
-                        'text': current_question,
-                        'options': options,
-                        'correct': correct_option
-                    })
-                i += 1
-                continue
-                
-            # SCENARIO 2: Question is one block, options are in the following blocks or tables
-            current_question = para_lines[0]['text'] if para_lines else block.text.strip()
-            options = []
-            correct_option = None
-            skip_question = has_image
-            
-            i += 1
-            # Look ahead for options
-            while i < len(blocks):
-                next_block = blocks[i]
-                
-                if isinstance(next_block, Paragraph):
-                    if not next_block.text.strip():
-                        i += 1
-                        continue
-                        
-                    # Stop looking if we already collected 4 options
-                    if len(options) >= 4:
-                        break
-                        
-                    if 'w:drawing' in next_block._element.xml or 'v:imagedata' in next_block._element.xml:
-                        skip_question = True
-                        
-                    nxt_lines = extract_colored_lines(next_block)
-                    for nl in nxt_lines:
-                        options.append(nl['text'])
-                        if nl['is_red']:
-                            correct_option = nl['text']
-                    i += 1
+        elif isinstance(block, Table):
+            if not parsing_started: continue
+            has_img = 'w:drawing' in block._element.xml or 'v:imagedata' in block._element.xml
+            for row in block.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        cell_lines = extract_colored_lines(p)
+                        for l in cell_lines:
+                            l['has_image'] = has_img
+                            all_lines.append(l)
+
+    # Group the flattened lines into dynamic Question/Option packages
+    questions = []
+    current_q = None
+    current_options = []
+    correct_opt = None
+    q_has_image = False
+    
+    for line in all_lines:
+        text = line['text']
+        is_red = line['is_red']
+        has_img = line['has_image']
+        
+        starts_with_num = bool(re.match(r'^(Q?\d+[\.\)])\s+', text, re.IGNORECASE))
+        looks_like_q = is_new_question_start(text)
+        is_option_format = bool(re.match(r'^([a-zA-Z][\.\)]\s+|Answer:)', text, re.IGNORECASE))
+        
+        # Decide if this line breaks off into a new question
+        is_new = False
+        if current_q is None:
+            is_new = True
+        elif starts_with_num:
+            is_new = True
+        elif len(current_options) >= 1:
+            if looks_like_q and not is_option_format:
+                is_new = True
+            elif is_option_format:
+                is_new = False
+            elif is_red:
+                is_new = False # Red text is always the correct option
+            elif len(current_options) >= 2 and not is_option_format and len(text) > 45:
+                # Ambiguous long text after options -> assume new question
+                is_new = True
+
+        if is_new:
+            # Package the PREVIOUS question before starting the new one
+            if current_q:
+                # Enforce a default correct answer if no red text was found
+                if not correct_opt and current_options:
+                    correct_opt = current_options[0] 
                     
-                elif isinstance(next_block, Table):
-                    if 'w:drawing' in next_block._element.xml or 'v:imagedata' in next_block._element.xml:
-                        skip_question = True
-                        
-                    for row in next_block.rows:
-                        for cell in row.cells:
-                            for p in cell.paragraphs:
-                                cell_lines = extract_colored_lines(p)
-                                for cl in cell_lines:
-                                    options.append(cl['text'])
-                                    if cl['is_red']:
-                                        correct_option = cl['text']
-                    i += 1
-                    break # Tables usually hold all the options, so stop looking after parsing it
+                if q_has_image:
+                    questions.append({
+                        'q_id': f"{exam_id}_{len(questions) + 1}",
+                        'text': f"[IMAGE REQUIRED - UPDATE MANUALLY] {current_q}",
+                        'options': current_options if current_options else ["Option A", "Option B", "Option C", "Option D"],
+                        'correct': correct_opt if current_options else "Option A"
+                    })
+                elif len(current_options) > 1:
+                    questions.append({
+                        'q_id': f"{exam_id}_{len(questions) + 1}",
+                        'text': current_q,
+                        'options': current_options,
+                        'correct': correct_opt
+                    })
                     
-            # Append gathered data
-            if skip_question:
-                parsed_data.append({
-                    'q_id': f"{exam_id}_{len(parsed_data) + 1}",
-                    'text': f"[IMAGE REQUIRED - UPDATE MANUALLY] {current_question}",
-                    'options': ["Placeholder A", "Placeholder B", "Placeholder C", "Placeholder D"],
-                    'correct': "Placeholder A"
-                })
-            elif len(options) >= 2:
-                if not correct_option: 
-                    correct_option = options[0] # Fallback if no red text is found
-                parsed_data.append({
-                    'q_id': f"{exam_id}_{len(parsed_data) + 1}",
-                    'text': current_question,
-                    'options': options,
-                    'correct': correct_option
-                })
+            # Reset trackers for the NEW question
+            current_q = text
+            current_options = []
+            correct_opt = None
+            q_has_image = has_img
         else:
-            i += 1
+            # Add to current options
+            current_options.append(text)
+            if is_red: 
+                correct_opt = text
+                
+        if has_img:
+            q_has_image = True
+
+    # Package the FINAL question in the loop
+    if current_q:
+        if not correct_opt and current_options:
+            correct_opt = current_options[0]
+        if q_has_image:
+            questions.append({
+                'q_id': f"{exam_id}_{len(questions) + 1}",
+                'text': f"[IMAGE REQUIRED - UPDATE MANUALLY] {current_q}",
+                'options': current_options if current_options else ["Option A", "Option B", "Option C", "Option D"],
+                'correct': correct_opt if current_options else "Option A"
+            })
+        elif len(current_options) > 1:
+            questions.append({
+                'q_id': f"{exam_id}_{len(questions) + 1}",
+                'text': current_q,
+                'options': current_options,
+                'correct': correct_opt
+            })
             
-    return parsed_data
+    return questions
 
 # --- Excel Generation Logic ---
 def generate_lms_excel(parsed_data, domain_id):
@@ -214,7 +246,7 @@ def generate_lms_excel(parsed_data, domain_id):
 st.set_page_config(page_title="LMS Question Converter", layout="centered")
 
 st.title("📄 Word to SAP SF LMS Converter")
-st.write("Upload your formatted Word document to generate the LMS import file. Questions containing images will be generated as placeholders to preserve numbering.")
+st.write("Upload your formatted Word document to generate the LMS import file. Safely handles variable option counts (2, 4, 6+), soft-returns, and image placeholders.")
 
 exam_id = st.text_input("Enter Exam ID (e.g., MCT_2023)", "MCT_2023")
 domain_id = st.text_input("Enter LMS Domain ID", "YOUR_DOMAIN")
@@ -222,9 +254,9 @@ uploaded_word = st.file_uploader("Upload Word Document (.docx)", type=["docx"])
 
 if st.button("Convert Document"):
     if uploaded_word is not None and exam_id:
-        with st.spinner("Parsing document..."):
+        with st.spinner("Dynamically parsing document..."):
             try:
-                questions = parse_with_placeholders(uploaded_word, exam_id)
+                questions = parse_unlimited_options(uploaded_word, exam_id)
                 
                 if not questions:
                     st.error("No valid questions found. Please check the document format.")
